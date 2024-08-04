@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"embed"
 	"fmt"
 	"io"
@@ -9,13 +8,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gin-gonic/gin"
 )
 
 //go:embed static/*
 var staticFiles embed.FS
+
+// Client represents a single connection from a client.
+type Client struct {
+	logChannel chan string
+	disconnect chan bool
+}
+
+// ClientManager handles all connected clients.
+type ClientManager struct {
+	clients map[string][]*Client
+	mu      sync.Mutex
+}
+
+var clientManager = &ClientManager{
+	clients: make(map[string][]*Client),
+}
 
 func main() {
 	router := gin.Default()
@@ -57,31 +74,33 @@ func main() {
 			return
 		}
 
-		filePath := filepath.Join("/tmp/local", filename)
-		file, err := os.Open(filePath)
-		if err != nil {
-			c.String(http.StatusInternalServerError, "Error opening file")
-			return
+		client := &Client{
+			logChannel: make(chan string),
+			disconnect: make(chan bool),
 		}
-		defer file.Close()
+
+		clientManager.mu.Lock()
+		clientManager.clients[filename] = append(clientManager.clients[filename], client)
+		clientManager.mu.Unlock()
 
 		c.Writer.Header().Set("Content-Type", "text/event-stream")
 		c.Writer.Header().Set("Cache-Control", "no-cache")
 		c.Writer.Header().Set("Connection", "keep-alive")
 
-		reader := bufio.NewReader(file)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err != io.EOF {
-					c.String(http.StatusInternalServerError, "Error reading file")
-				}
-				break
+		c.Stream(func(w io.Writer) bool {
+			select {
+			case log := <-client.logChannel:
+				fmt.Fprintf(w, "data: %s\n\n", log)
+				return true
+			case <-client.disconnect:
+				return false
 			}
-			fmt.Fprintf(c.Writer, "data: %s\n\n", line)
-			c.Writer.Flush()
-			time.Sleep(1 * time.Second) // Simulate real-time log streaming
-		}
+		})
+
+		client.disconnect <- true
+		clientManager.mu.Lock()
+		removeClient(filename, client)
+		clientManager.mu.Unlock()
 	})
 
 	// List log files
@@ -104,5 +123,143 @@ func main() {
 		})
 	})
 
+	// Download log file
+	router.GET("/api/download/:filename", func(c *gin.Context) {
+		filename := c.Param("filename")
+		if !strings.HasSuffix(filename, ".log") {
+			c.String(http.StatusBadRequest, "Invalid file type")
+			return
+		}
+
+		filePath := filepath.Join("/tmp/local", filename)
+		c.File(filePath)
+	})
+
+	go monitorLogFiles()
+
 	router.Run(":8080")
+}
+
+func monitorLogFiles() {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fmt.Println("ERROR", err)
+		return
+	}
+	defer watcher.Close()
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					go tailLogFile(filepath.Base(event.Name))
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				fmt.Println("ERROR", err)
+			}
+		}
+	}()
+
+	err = watcher.Add("/tmp/local")
+	if err != nil {
+		fmt.Println("ERROR", err)
+	}
+	// Add existing log files to the watcher
+	files, err := os.ReadDir("/tmp/local")
+	if err == nil {
+		for _, file := range files {
+			if strings.HasSuffix(file.Name(), ".log") {
+				go tailLogFile(file.Name())
+			}
+		}
+	}
+	<-make(chan struct{}) // Keep the function running
+}
+
+func tailLogFile(filename string) {
+	filePath := filepath.Join("/tmp/local", filename)
+	file, err := os.Open(filePath)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	var fileSize int64
+	stat, err := file.Stat()
+	if err != nil {
+		return
+	}
+	fileSize = stat.Size()
+
+	// Read and send the entire file content initially
+	file.Seek(0, io.SeekStart)
+	buf := make([]byte, fileSize)
+	_, err = file.Read(buf)
+	if err != nil && err != io.EOF {
+		return
+	}
+	lines := strings.Split(string(buf), "\n")
+	for _, line := range lines {
+		if line != "" {
+			clientManager.mu.Lock()
+			for _, client := range clientManager.clients[filename] {
+				select {
+				case client.logChannel <- line:
+				case <-time.After(1 * time.Second):
+					// Client not ready, skip
+				}
+			}
+			clientManager.mu.Unlock()
+		}
+	}
+
+	// Continue monitoring the file for new data
+	for {
+		newStat, err := file.Stat()
+		if err != nil {
+			return
+		}
+		newSize := newStat.Size()
+		if newSize > fileSize {
+			file.Seek(fileSize, io.SeekStart)
+			buf := make([]byte, newSize-fileSize)
+			_, err := file.Read(buf)
+			if err != nil && err != io.EOF {
+				return
+			}
+			lines := strings.Split(string(buf), "\n")
+			for _, line := range lines {
+				if line != "" {
+					clientManager.mu.Lock()
+					for _, client := range clientManager.clients[filename] {
+						select {
+						case client.logChannel <- line:
+						case <-time.After(1 * time.Second):
+							// Client not ready, skip
+						}
+					}
+					clientManager.mu.Unlock()
+				}
+			}
+			fileSize = newSize
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func removeClient(filename string, client *Client) {
+	clients := clientManager.clients[filename]
+	for i, c := range clients {
+		if c == client {
+			clientManager.clients[filename] = append(clients[:i], clients[i+1:]...)
+			break
+		}
+	}
 }

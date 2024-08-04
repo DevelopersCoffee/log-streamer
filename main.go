@@ -191,49 +191,23 @@ func tailLogFile(filename string) {
 	}
 	defer file.Close()
 
-	var fileSize int64
-	stat, err := file.Stat()
-	if err != nil {
-		return
-	}
-	fileSize = stat.Size()
+	var lastReadPos int64
 
-	// Read and send the entire file content initially
-	file.Seek(0, io.SeekStart)
-	buf := make([]byte, fileSize)
-	_, err = file.Read(buf)
-	if err != nil && err != io.EOF {
-		return
-	}
-	lines := strings.Split(string(buf), "\n")
-	for _, line := range lines {
-		if line != "" {
-			clientManager.mu.Lock()
-			for _, client := range clientManager.clients[filename] {
-				select {
-				case client.logChannel <- line:
-				case <-time.After(1 * time.Second):
-					// Client not ready, skip
-				}
-			}
-			clientManager.mu.Unlock()
-		}
-	}
-
-	// Continue monitoring the file for new data
 	for {
-		newStat, err := file.Stat()
+		stat, err := file.Stat()
 		if err != nil {
 			return
 		}
-		newSize := newStat.Size()
-		if newSize > fileSize {
-			file.Seek(fileSize, io.SeekStart)
-			buf := make([]byte, newSize-fileSize)
+		fileSize := stat.Size()
+		if fileSize > lastReadPos {
+			file.Seek(lastReadPos, io.SeekStart)
+			buf := make([]byte, fileSize-lastReadPos)
 			_, err := file.Read(buf)
 			if err != nil && err != io.EOF {
 				return
 			}
+			lastReadPos = fileSize
+
 			lines := strings.Split(string(buf), "\n")
 			for _, line := range lines {
 				if line != "" {
@@ -248,7 +222,6 @@ func tailLogFile(filename string) {
 					clientManager.mu.Unlock()
 				}
 			}
-			fileSize = newSize
 		}
 		time.Sleep(1 * time.Second)
 	}

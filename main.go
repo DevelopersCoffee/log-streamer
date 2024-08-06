@@ -20,16 +20,17 @@ var staticFiles embed.FS
 
 // Client represents a single connection from a client.
 type Client struct {
-	logChannel chan string
-	disconnect chan bool
+	logChannel chan string // Channel to send log messages to the client.
+	disconnect chan bool   // Channel to signal client disconnection.
 }
 
 // ClientManager handles all connected clients.
 type ClientManager struct {
-	clients map[string][]*Client
-	mu      sync.Mutex
+	clients map[string][]*Client // Map of log filenames to their clients.
+	mu      sync.Mutex           // Mutex to synchronize access to clients.
 }
 
+// Initialize a global client manager.
 var clientManager = &ClientManager{
 	clients: make(map[string][]*Client),
 }
@@ -37,7 +38,7 @@ var clientManager = &ClientManager{
 func main() {
 	router := gin.Default()
 
-	// Serve the index.html file for the root URL
+	// Serve the index.html file for the root URL.
 	router.GET("/", func(c *gin.Context) {
 		data, err := staticFiles.ReadFile("static/index.html")
 		if err != nil {
@@ -47,7 +48,7 @@ func main() {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	})
 
-	// Serve static files
+	// Serve static files.
 	router.GET("/static/*filepath", func(c *gin.Context) {
 		filePath := "static/static" + c.Param("filepath")
 		file, err := staticFiles.Open(filePath)
@@ -66,7 +67,7 @@ func main() {
 		http.ServeContent(c.Writer, c.Request, filePath, stat.ModTime(), file.(io.ReadSeeker))
 	})
 
-	// Serve log files for streaming
+	// Serve log files for streaming.
 	router.GET("/api/logs/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
 		if !strings.HasSuffix(filename, ".log") {
@@ -74,6 +75,7 @@ func main() {
 			return
 		}
 
+		// Create a new client for the log stream.
 		client := &Client{
 			logChannel: make(chan string),
 			disconnect: make(chan bool),
@@ -83,10 +85,12 @@ func main() {
 		clientManager.clients[filename] = append(clientManager.clients[filename], client)
 		clientManager.mu.Unlock()
 
+		// Set up headers for SSE (Server-Sent Events).
 		c.Writer.Header().Set("Content-Type", "text/event-stream")
 		c.Writer.Header().Set("Cache-Control", "no-cache")
 		c.Writer.Header().Set("Connection", "keep-alive")
 
+		// Stream log data to the client.
 		c.Stream(func(w io.Writer) bool {
 			select {
 			case log := <-client.logChannel:
@@ -97,13 +101,14 @@ func main() {
 			}
 		})
 
+		// Clean up the client connection.
 		client.disconnect <- true
 		clientManager.mu.Lock()
 		removeClient(filename, client)
 		clientManager.mu.Unlock()
 	})
 
-	// List log files
+	// List log files.
 	router.GET("/api/files", func(c *gin.Context) {
 		files, err := os.ReadDir("/tmp/local")
 		if err != nil {
@@ -123,7 +128,7 @@ func main() {
 		})
 	})
 
-	// Download log file
+	// Download log file.
 	router.GET("/api/download/:filename", func(c *gin.Context) {
 		filename := c.Param("filename")
 		if !strings.HasSuffix(filename, ".log") {
@@ -135,11 +140,14 @@ func main() {
 		c.File(filePath)
 	})
 
+	// Start monitoring log files for changes.
 	go monitorLogFiles()
 
+	// Start the web server on port 8080.
 	router.Run(":8080")
 }
 
+// monitorLogFiles sets up a file watcher to monitor changes in log files.
 func monitorLogFiles() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -148,6 +156,7 @@ func monitorLogFiles() {
 	}
 	defer watcher.Close()
 
+	// Goroutine to handle file system events.
 	go func() {
 		for {
 			select {
@@ -156,6 +165,7 @@ func monitorLogFiles() {
 					return
 				}
 				if event.Op&fsnotify.Write == fsnotify.Write {
+					// Tail the log file when it is written to.
 					go tailLogFile(filepath.Base(event.Name))
 				}
 			case err, ok := <-watcher.Errors:
@@ -167,11 +177,13 @@ func monitorLogFiles() {
 		}
 	}()
 
+	// Add the directory to be monitored.
 	err = watcher.Add("/tmp/local")
 	if err != nil {
 		fmt.Println("ERROR", err)
 	}
-	// Add existing log files to the watcher
+
+	// Add existing log files to the watcher.
 	files, err := os.ReadDir("/tmp/local")
 	if err == nil {
 		for _, file := range files {
@@ -180,9 +192,10 @@ func monitorLogFiles() {
 			}
 		}
 	}
-	<-make(chan struct{}) // Keep the function running
+	<-make(chan struct{}) // Keep the function running.
 }
 
+// tailLogFile reads and sends new log entries to connected clients.
 func tailLogFile(filename string) {
 	filePath := filepath.Join("/tmp/local", filename)
 	file, err := os.Open(filePath)
@@ -227,6 +240,7 @@ func tailLogFile(filename string) {
 	}
 }
 
+// removeClient removes a client from the list of connected clients for a given log file.
 func removeClient(filename string, client *Client) {
 	clients := clientManager.clients[filename]
 	for i, c := range clients {
